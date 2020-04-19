@@ -1,10 +1,19 @@
+from IPython.display import display
 import itertools
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import pandas_flavor as pf
+import seaborn as sns
+import scikit_posthocs as sp
 import scipy.stats as stats
+from scipy.stats import skew, kurtosis
+from sklearn.linear_model import LinearRegression
+from statsmodels.formula.api import ols
+import statsmodels.api as sm
 import statsmodels.stats.api as sms
+from statsmodels.stats.power import  tt_ind_solve_power
+#plt.style.use('ggplot')
 
 def bootstrap(A, B):
     combined = A + B
@@ -12,6 +21,199 @@ def bootstrap(A, B):
     resampled_A = resampled[:len(A)]
     resampled_B = resampled[len(A):]
     return resampled_A, resampled_B
+
+def bootstrap_sim(dataframe, feature, target, control_groups=None, num_trials=20000, alternate='both', param='mean', p_adjust=False, show_hist=False):
+    text_color = plt.rcParams.get('ytick.color')
+    controls = []
+    groups = dataframe.groupby(feature)[target]
+    if control_groups is None:
+        controls = [x[0] for x in groups]
+    else:
+        if type(control_groups) == str:
+            controls = [control_groups]
+        else:
+            try:
+                it = iter(control_groups)
+            except:
+                controls = [control_groups]
+            else:
+                for cont in control_groups:
+                    controls.append(cont)
+    results = pd.DataFrame()
+    #k = len(groups) - 1
+    #if len(controls) > 1:
+    js = range(1, len(controls)+1)
+    lst = [(len(groups) - j) for j in js]
+    k = sum(lst)
+    cols = len(groups) - 1
+    row = 0
+    string = ''
+    
+    if show_hist:
+        nrows = (k-cols)//cols + 1
+        if nrows == 1:
+            vsize = 6
+        else:
+            vsize = 2
+        fig, axes = plt.subplots(nrows=nrows, 
+                                 ncols=(cols),
+                                 figsize=(12, vsize*nrows)
+                                )
+        fig.tight_layout(h_pad=2)
+        if nrows > 1:
+            axes = axes.flatten()
+        else:
+            axes = [axes]
+    
+    if param == 'mean':
+        param_function = np.mean
+    elif param == 'median':
+        param_function = np.median
+    elif param == 'mode':
+        param_function = pd.Series.mode
+    elif param == 'var':
+        param_function = np.var
+    elif param == 'std':
+        param_function = np.std
+    else:
+        return ("Error: invalid parameter passed.")
+    
+    print("Performing bootstrap simulation for parameter: {}".format(param))
+    
+    control_lists = []
+    group_diffs = []
+    combos = []
+    measured_diffs = []
+    prev_controls = []
+    for control in controls:
+        p_vals = {}
+        #group_diffs = []
+        print("Testing control group: {}".format(control))
+        for name, group in groups:
+            if name == control:
+                control_group = group.copy()
+                if param == 'mode':
+                    control_param = np.mean(param_function(control_group))
+                elif param == 'var' or param == 'std':
+                    control_param = param_function(control_group, ddof=1)
+                else:
+                    control_param = param_function(control_group)
+                
+        for name, group in groups:
+            group_p = {}
+            diffs_list = []
+            if name == control or name in prev_controls:
+                continue
+            if param == 'mode':
+                exp_param = np.mean(param_function(group))
+            elif param == 'var' or param == 'std':
+                exp_param = param_function(group, ddof=1)
+            else:
+                exp_param = param_function(group)
+            param_diff = exp_param - control_param
+            further_diffs = 0
+
+            if alternate == 'both':
+                param_diff = np.abs(param_diff)            
+
+            for i in range(num_trials):
+                bA, bB = bootstrap(list(control_group), list(group))
+                if param == 'mode':
+                    diff = np.mean(param_function(bB)) - np.mean(param_function(bA))
+                    diffs_list.append(diff)
+                else:
+                    diff = param_function(bB) - param_function(bA)
+                    diffs_list.append(diff)
+
+                if alternate == 'both':
+                    diff = np.abs(diff)
+
+                if alternate == 'lower':
+                    if diff <= param_diff:
+                        further_diffs += 1
+                elif alternate == 'both' or alternate == 'higher':
+                    if diff >= param_diff:
+                        further_diffs += 1
+                else:
+                    print("Error: invalid alternative hypothesis. Options are 'both', 'higher', or 'lower'")
+                    break
+
+            p = further_diffs / num_trials
+            if p_adjust:
+                string = "p-values adjusted for {} group comparisons".format(k)
+                p *= k
+                if p > 1:
+                    p = 1
+            group_p['p_val to {}'.format(control)] = p
+            p_vals[name] = group_p
+            measured_diffs.append(param_diff)
+            group_diffs.append(diffs_list)
+            combos.append((control, name))
+            prev_controls.append(control)
+            
+        result = pd.DataFrame.from_dict(p_vals)
+        results = pd.concat([results, result], axis=0, sort=False)
+            
+    if show_hist:
+        list_num = 0
+        for ax in axes:
+            if list_num > len(group_diffs):
+                break
+            group_list = group_diffs[list_num]
+            diff_mean = round(np.mean(group_list), 2)
+            diff_std = np.std(group_list, ddof=1)
+            xs = np.linspace(min(group_list), max(group_list), 1000)
+            ys = stats.norm.pdf(xs, loc=diff_mean, scale=diff_std)
+            ax.plot(xs, ys, color='gray')
+            ax.hist(group_list, alpha=0.6, density=True)
+            ax.axvline(x=measured_diffs[list_num], 
+                       ls=':', 
+                       label='Mean: {}'.format(diff_mean),
+                       color='black')
+            ax.set_title('{} vs {}'.format(combos[list_num][0], combos[list_num][1]),
+                        color=text_color)
+            #ax.legend()
+            list_num += 1
+
+        plt.show()
+    print(string)
+    
+    return results             
+
+def check_normality(data, cols, display_results=True):
+    info = {}
+    ad_results = {}
+    
+    for col in cols:
+        if type(data) == pd.core.frame.DataFrame:
+            x = data[col]
+        else:
+            x = data
+        
+         # Perform Anderson-Darling test on data
+        stat, crit, p = stats.anderson(x, 'norm')
+        ad_results[col] = {}
+        ad_results[col]['statistic'] = stat
+        ad_results[col]['critical'] = crit[2]
+        
+        info[col] = {}
+        info[col]['K-S'] = {}
+        info[col]['Shapiro-Wilk'] = {}
+        info[col]['K-S']['Statistic'], info[col]['K-S']['p-value'] = stats.kstest(x, 'norm')
+        info[col]['Shapiro-Wilk']['Statistic'], info[col]['Shapiro-Wilk']['p-value'] = stats.shapiro(x)
+        
+    dict_of_df = {k: pd.DataFrame(v) for k,v in info.items()}
+    test_results = pd.concat(dict_of_df, axis=0)
+    #mux = pd.MultiIndex.from_tuples(ad_results.keys())
+    ad_results = pd.DataFrame.from_dict(ad_results, orient='index')
+    #ad_results = pd.DataFrame(ad_results, index=mux)
+    if display_results == True:
+        print("Normality Test Results for {}:".format(cols))
+        print("-------------------------------------------------------------------------------------------")
+        names = ["K-S and Shapiro-Wilk:", "Anderson-Darling:"]
+        display_side_by_side(test_results, ad_results, names=names)
+        
+    return test_results, ad_results
 
 def cohen_d(A, B):
     n1, n2 = len(A), len(B)
@@ -33,6 +235,123 @@ def combT(a,b):
         groupings.append((list(combination), temp_list))
     return groupings
 
+def compare_groups(dataframe, feature, targets, control_group=None, alpha=0.05, p_adjust=False, show_groups=True, **kwargs):
+    figsize = (12,8)
+    edgecolor = None
+    # Deal with keyword arguments
+    for k, v in kwargs.items():
+        if k not in ['figsize','edgecolor']:
+            raise TypeError("compare_groups got an unexpected keyword argument {}".format(k))
+        else:
+            if k == 'figsize':
+                figsize = v
+            elif k == 'edgecolor':
+                edgecolor = v
+    text_color = plt.rcParams.get('ytick.color')
+    # Deal with targets input
+    if type(targets) == str:
+        targets = [targets]
+    for target in targets:
+        control = None
+        info = {}
+        grouped = dataframe.groupby([feature])[target]
+        if control_group is None:
+            control_group = grouped.iloc[0][0]
+        k = len(grouped) - 1
+        for group in grouped:
+            temp = {}
+            if group[0] == control_group:
+                control = np.array(group[1])
+                continue
+            else:
+                test_group = np.array(group[1])
+                size = len(test_group)
+                if size == 1:
+                    mu, std = control.mean(), control.std(ddof=1)
+                    effect_size = np.abs((test_group[0] - mu) / std)
+                    p = 2 * stats.norm.sf(effect_size)                    
+                else:
+                    stat, p = stats.ttest_ind(test_group, control, equal_var=False)
+                    effect_size = cohen_d(test_group, control)
+                if p_adjust:
+                    p *= k
+                    if p > 1:
+                        p = 1
+                
+                temp['p-val'] = p
+                temp['effect size'] = effect_size
+                temp['size'] = size
+                temp['power'] = tt_ind_solve_power(effect_size = effect_size,
+                                                  nobs1 = size,
+                                                  alpha = alpha,
+                                                  ratio = len(control) / size)
+                info[group[0]] = temp
+
+        info = pd.DataFrame.from_dict(info)
+        print('Testing {} groups for statistically significant effects on {}'.format(feature, target))
+        display(info.round(6))
+        
+        # Plot test results
+        X = list([str(x) for x in info.columns])
+        if not show_groups:
+            fig, (ax1, ax2) = plt.subplots(2, sharex=True, figsize=figsize, 
+                                           gridspec_kw={"hspace": 0.05})
+        else:
+            fig = plt.figure(constrained_layout=True, figsize=figsize)
+            gs = fig.add_gridspec(2, 2)
+            ax = fig.add_subplot(gs[:, 0])
+            if edgecolor is not None:
+                ax = sns.boxplot(x=dataframe[feature], y=dataframe[target],
+                                 whiskerprops={'color': edgecolor},
+                                 capprops={'color': edgecolor},
+                                 flierprops={'markerfacecolor': edgecolor,
+                                             'markeredgecolor': edgecolor}
+                                )
+            else:
+                ax = sns.boxplot(x=dataframe[feature], y=dataframe[target])
+            # fix edgecolors if needed:
+            #if edgecolor is not None:
+            #    for i, artist in enumerate(ax.artists):
+            #        #artist.set_edgecolor(edgecolor)
+            #        for j in range(i*6, i*6+6):
+            #            if j in range(i*6+4, i*6+6):
+            #                continue
+            #            line = ax.lines[j]
+            #            line.set_color(edgecolor)
+            #            line.set_mfc(edgecolor)
+            #            line.set_mec(edgecolor)
+            ax1 = fig.add_subplot(gs[0, 1])
+            ax2 = fig.add_subplot(gs[1, 1])
+        ax1.set_title('Target: {}'.format(target), color=text_color)
+        if len(grouped) - 1 == 1:
+            ax1.scatter(X,
+                        info.loc['p-val'], 
+                        color='#3572C6', 
+                        label='p-value', 
+                        marker='x',
+                        linewidth=4,
+                        s=50,
+                       )
+        else:
+            ax1.plot(X, info.loc['p-val'], color='#3572C6', label='p-value')
+        ax1.axhline(y=alpha, ls='-.', label='alpha: {}'.format(alpha), alpha=0.7)
+        ax1.set(xlabel='')
+        ax1.legend()
+        if len(grouped) - 1 == 1:
+            ax2.scatter(X,
+                        info.loc['effect size'], 
+                        color='g', 
+                        label='effect size', 
+                        marker='x',
+                        linewidth=4,
+                        s=50,
+                       )
+        else:
+            ax2.plot(X, info.loc['effect size'], color='g', label='effect size')
+        ax2.set_xlabel('{}'.format(feature), color=text_color)
+        ax2.legend()
+        plt.show()
+
 from IPython.display import display_html
 def display_side_by_side(*args, names=None):
     html_str=''
@@ -46,11 +365,88 @@ def display_side_by_side(*args, names=None):
         html_str+='</td>'
     html_str+='</table></body>'
     display_html(html_str.replace('table','table style="display:inline" cellpadding=100'),raw=True)
+    
+def do_a_linreg(dataframe, features, target):
+    linreg_type = None
+    text_color = plt.rcParams.get('ytick.color')
+    if type(features) == str:
+        try:
+            np.issubdtype(dataframe[features].dtype, np.number)
+        except:
+            linreg_type = 'multi'
+        else:
+            linreg_type = 'simple'
+        predictors = features
+        feature = features
+    else:
+        try:
+            it = iter(features)
+        except:
+            targets = [targets]
+        if len(features) == 1:
+            try:
+                np.issubdtype(dataframe[features[0]].dtype, np.number)
+            except:
+                linreg_type = 'multi'
+            else:
+                linreg_type = 'simple'
+            predictors = features[0]
+        else:
+            linreg_type = 'multi'
+            predictors = '+'.join(features)
+    formula = target + '~' + predictors
+    print("Linear Regression for {}".format(formula))
+    
+    # Use scipy to generate a graph of regression over data
+    if linreg_type == 'simple':
+        linreg = LinearRegression().fit(np.reshape([dataframe[feature]],(-1,1)), dataframe[target])
+        X = np.linspace(dataframe[feature].min(), dataframe[feature].max(), 500).reshape(-1,1)
+        y = linreg.predict(X)
+        plt.figure(figsize=(12,6))
+        plt.scatter(dataframe[feature], dataframe[target], color='green')
+        plt.xlabel(feature, color=text_color)
+        plt.ylabel(target, color=text_color)
+        plt.title("Linear Regression for {} ~ {}".format(target,feature), color=text_color)
+        plt.plot(X,y)
+        plt.show()
+    
+    # Build statsmodels mode
+    model = ols(formula, dataframe).fit()
+    display(model.summary())
+    
+    # Plot Q-Q plot of residuals
+    fig, (ax1, ax2) = plt.subplots(ncols=2, figsize=(12,6))
+    ax1.set_title("Q-Q plot for model residuals", color=text_color)
+    sm.graphics.qqplot(model.resid, dist=stats.norm, line='45', fit=True, ax=ax1);
+    
+    # Perform Goldfeld-Quandt test of homoscedasticity
+    GQ_results = goldfeld_quandt(dataframe, target, model, ax2)
+    
+    print("Test for homoscedasticity of residuals:")
+    display(GQ_results)
+    # Perform normality check on residuals
+    check_normality(model.resid, cols=['residuals']);
+    print("Skew:", skew(model.resid))
+    print("Kurtosis:", kurtosis(model.resid))
+    
+    plt.show()
+    
+    return model
 
-def ecdf(data, group_by=None, targets=None, ax=None):
+def ecdf(data, group_by=None, targets=None, ax=None, **kwargs):
     """Produces ECDF graphs for input data. Inputs can be 1d array-like, pandas Series, or
     pandas DataFrame. If a DataFrame is passed, group_by and targets may be set for group 
     comparisons. If no target is set for a DataFrame, all columns will be graphed."""
+    text_color = plt.rcParams.get('ytick.color')
+    linewidth = 2
+    # Handle keyword arguments
+    for k, v in kwargs.items():
+        if k not in ['linewidth']:
+            raise TypeError('ecdf got an unexpeted keyword argument: {}'.format(k))
+        else:
+            if k == 'linewidth':
+                linewidth = v
+    # Deal with input data
     if group_by is not None:
         if type(data) == pd.core.frame.DataFrame:
             print("Grouping DataFrame by {}".format(group_by))
@@ -100,7 +496,7 @@ def ecdf(data, group_by=None, targets=None, ax=None):
                 x = np.sort(group[variable])
                 n = len(group)
                 y = np.arange(1, n+1) / n
-                ax.plot(x, y, marker='.', label=name, alpha=0.6)
+                ax.plot(x, y, marker='.', label=name, alpha=0.7, linewidth=linewidth)
                 if max(x) > max_x:
                     max_x = max(x)
                     #max_x = 0
@@ -111,7 +507,7 @@ def ecdf(data, group_by=None, targets=None, ax=None):
             ax.annotate('0.95', xy=(max_x, 0.92))
             ax.annotate('0.05', xy=(max_x, 0.02))
             ax.legend()
-            plt.title("ECDF for feature: {}".format(variable), color='gray')
+            plt.title("ECDF for feature: {}".format(variable), color=text_color)
             plt.show()
                 
     else:
@@ -136,7 +532,7 @@ def ecdf(data, group_by=None, targets=None, ax=None):
         ax.annotate('0.5', xy=(max_x, 0.47))
         ax.annotate('0.95', xy=(max_x, 0.92))
         ax.annotate('0.05', xy=(max_x, 0.02))
-        plt.title("ECDF for {}".format(string), color='gray')
+        plt.title("ECDF for {}".format(string), color=text_color)
         plt.legend()
         plt.show()
 
@@ -181,6 +577,7 @@ def f_test_groups(data, group_var, target, alternate='both'):
     return scores         
 
 def goldfeld_quandt(dataframe, target, model, ax):
+    text_color = plt.rcParams.get('ytick.color')
     temp = dataframe.sort_values(by=target).reset_index(drop=True)
     lwr_thresh = temp[target].quantile(q=.45)
     upr_thresh = temp[target].quantile(q=.55)
@@ -189,9 +586,9 @@ def goldfeld_quandt(dataframe, target, model, ax):
     if not ax:
         fig, ax = plt.subplots(figsize=(6,6))
     ax.scatter(temp[target].iloc[indices], model.resid.iloc[indices])
-    ax.set_xlabel(target)
-    ax.set_ylabel('Model Residuals')
-    ax.set_title("Residuals versus {}".format(target), color='gray')
+    ax.set_xlabel(target, color=text_color)
+    ax.set_ylabel('Model Residuals', color=text_color)
+    ax.set_title("Residuals versus {}".format(target), color=text_color)
     ax.axvline(x=lwr_thresh, ls=':',linewidth=2, color='gray')
     ax.axvline(x=upr_thresh, ls=':',linewidth=2, color='gray')
     if not ax:
@@ -200,7 +597,43 @@ def goldfeld_quandt(dataframe, target, model, ax):
     results = pd.DataFrame(index=['Goldfeld-Quandt'], columns=['F_statistic', 'p_value'])
     results.loc['Goldfeld-Quandt','F_statistic'] = test[0]
     results.loc['Goldfeld-Quandt','p_value'] = test[1]
-    return results        
+    return results 
+
+def group_hist(data, feature, target, show_hist=True, return_groups=False):
+    text_color = plt.rcParams.get('ytick.color')
+    print('Showing stats for {} grouped by {}'.format(target, feature))
+    grouped = data.groupby([feature])[target]
+    stats = {}
+    for group in grouped:
+        temp = pd.Series(group[1])
+        stats[group[0]] = {}
+        stats[group[0]]['Mean'] = temp.mean()
+        stats[group[0]]['Median'] = temp.median()
+        stats[group[0]]['Std'] = temp.std(ddof=1)
+        stats[group[0]]['Size'] = len(temp)
+    
+    stats = pd.DataFrame.from_dict(stats, orient='index')
+    display(stats)
+    
+    if show_hist:
+        plt.figure(figsize=(12,7))
+        grouped.hist(density=True, histtype='step', alpha=1, stacked=True, lw=2)
+        plt.legend([x[0] for x in grouped])
+        plt.title('Grouped Histogram for {}'.format(target), color=text_color)
+        plt.xlabel(feature)
+        plt.show()
+    
+    if return_groups:
+        return stats, grouped
+    else:
+        return stats
+
+def make_boxplot(dataframe, x, y):
+    text_color = plt.rcParams.get('ytick.color')
+    fig, ax = plt.subplots(figsize=(12,6))
+    plt.title("Side by side comparison of all group distributions:", color=text_color)
+    sns.boxplot(x=dataframe[x], y=dataframe[y])
+    plt.show()
 
 # A function for metropolis MCMC algorithm:
 def metropolis(data1, theta_seed1, theta_std1, data2=None, theta_seed2=None, theta_std2=None, samples=10000):
@@ -446,6 +879,53 @@ def pooled_variance(groups):
     denom = sum([info[name]['n'] for name in names]) - k
     pooled_var = np.sqrt(numer/denom)
     return pooled_var
+
+def visualize_distribution(data, targets=None):
+    text_color = plt.rcParams.get('ytick.color')
+    results = check_normality(data, targets, display_results=False)
+    if type(data) != pd.core.frame.DataFrame:
+        targets = ['Data']
+        temp = pd.DataFrame()
+        temp['Data'] = data
+        data = temp
+    
+    for target in targets:
+        
+        mean = round(np.mean(data[target]), 5)
+        median = round(np.median(data[target]), 5)
+        print("Variable: {}".format(target))
+        test_results = check_normality(data, [target])
+        display(data[target].describe())
+        print("Skew: {}".format(skew(data[target])))
+        fig, (ax1, ax2) = plt.subplots(2, sharex=True, figsize=(12,6), 
+                                   gridspec_kw={"height_ratios": (.15, .85),
+                                               "hspace": 0.05})
+        ax1.set_title('Distribution of {}'.format(target), color=text_color)
+        sns.boxplot(data[target], ax=ax1)
+        ax1.set(xlabel='')
+        ax1.annotate(s='Median: {}'.format(median), 
+                    xy=(0.87, 0.1), xycoords="axes fraction")
+        sns.distplot(data[target], ax=ax2)
+        ax2.axvline(x=mean, ls=':', color='black', label='Mean: {}'.format(mean))
+        ax2.legend()
+        plt.show()
+        
+        fig2, (ax,ax2) = plt.subplots(ncols=2, figsize=(12,5))
+        stats.probplot(data[target], dist='norm', plot=ax)
+        ax.set_title('Q-Q Plot for {}'.format(target), color=text_color)
+        ecdf(data[target], ax=ax2)
+        
+        plt.show()
+        
+    #return results
+
+def tukey_trim(data, col, coef=1.5):
+    # Found a useful function in the scikit_posthoc that uses the Tukey fence method
+    trimmed = sp.outliers_iqr(data[col], coef=coef)
+    print("Length of old DataFrame:", len(data))
+    data = data[data[col].isin(trimmed)]
+    print("Length of Tukey trimmed DataFrame", len(data))
+    return(data)
 
 def dunnets_tstat(expr, ctrl, pooled_var):
     expr_mean = expr.mean()
